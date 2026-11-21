@@ -1,0 +1,327 @@
+name: Predictive Maintenance MLOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "data/**"
+      - ".github/workflows/pipeline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  # ==================================================
+  # JOB 1: DATA PREPARATION
+  # ==================================================
+
+  data-preparation:
+
+    name: Data Preparation
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas scikit-learn
+
+      - name: Validate and Prepare Dataset
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+
+          DATA_PATH = "data/engine_data.csv"
+          OUTPUT_DIR = "artifacts"
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          # Load dataset
+          data = pd.read_csv(DATA_PATH)
+
+          print("Original dataset shape:", data.shape)
+
+          # Validate columns
+          required_columns = [
+              "Engine rpm",
+              "Lub oil pressure",
+              "Fuel pressure",
+              "Coolant pressure",
+              "lub oil temp",
+              "Coolant temp",
+              "Engine Condition"
+          ]
+
+          missing = [
+              col for col in required_columns
+              if col not in data.columns
+          ]
+
+          if missing:
+              raise ValueError(f"Missing columns: {missing}")
+
+          data = data[required_columns].copy()
+
+          # Standardize column names
+          column_mapping = {
+              "Engine rpm": "Engine_RPM",
+              "Lub oil pressure": "Lub_Oil_Pressure",
+              "Fuel pressure": "Fuel_Pressure",
+              "Coolant pressure": "Coolant_Pressure",
+              "lub oil temp": "Lub_Oil_Temperature",
+              "Coolant temp": "Coolant_Temperature",
+              "Engine Condition": "Engine_Condition"
+          }
+
+          data.rename(columns=column_mapping, inplace=True)
+
+          # Convert values to numeric
+          for col in data.columns:
+              data[col] = pd.to_numeric(
+                  data[col], errors="coerce"
+              )
+
+          # Remove duplicates and missing targets
+          data.drop_duplicates(inplace=True)
+          data.dropna(subset=["Engine_Condition"], inplace=True)
+
+          # Validate target
+          if not set(data["Engine_Condition"].unique()).issubset({0, 1}):
+              raise ValueError("Target must contain only 0 and 1.")
+
+          if data["Engine_Condition"].nunique() != 2:
+              raise ValueError("Both target classes must be present.")
+
+          data["Engine_Condition"] = data["Engine_Condition"].astype(int)
+
+          # Split features and target
+          X = data.drop(columns=["Engine_Condition"])
+          y = data["Engine_Condition"]
+
+          X_train, X_test, y_train, y_test = train_test_split(
+              X,
+              y,
+              test_size=0.20,
+              random_state=42,
+              stratify=y
+          )
+
+          # Save train and test datasets
+          train_data = X_train.copy()
+          train_data["Engine_Condition"] = y_train
+
+          test_data = X_test.copy()
+          test_data["Engine_Condition"] = y_test
+
+          train_data.to_csv(
+              f"{OUTPUT_DIR}/train.csv", index=False
+          )
+
+          test_data.to_csv(
+              f"{OUTPUT_DIR}/test.csv", index=False
+          )
+
+          print("Data preparation completed.")
+          print("Training records:", len(train_data))
+          print("Testing records:", len(test_data))
+          PY
+
+      - name: Upload Prepared Data
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-engine-data
+          path: artifacts/
+          retention-days: 5
+
+  # ==================================================
+  # JOB 2: MODEL TRAINING AND EVALUATION
+  # ==================================================
+
+  model-training:
+
+    name: XGBoost Model Training
+
+    needs: data-preparation
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download Prepared Data
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-engine-data
+          path: artifacts/
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pandas scikit-learn xgboost joblib
+
+      - name: Train XGBoost Model
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import joblib
+          import pandas as pd
+
+          from sklearn.compose import ColumnTransformer
+          from sklearn.pipeline import Pipeline
+          from sklearn.impute import SimpleImputer
+          from sklearn.preprocessing import StandardScaler
+
+          from sklearn.metrics import (
+              accuracy_score,
+              precision_score,
+              recall_score,
+              f1_score,
+              roc_auc_score,
+              classification_report
+          )
+
+          from xgboost import XGBClassifier
+
+          # Load prepared datasets
+          train_df = pd.read_csv("artifacts/train.csv")
+          test_df = pd.read_csv("artifacts/test.csv")
+
+          target = "Engine_Condition"
+
+          X_train = train_df.drop(columns=[target])
+          y_train = train_df[target]
+
+          X_test = test_df.drop(columns=[target])
+          y_test = test_df[target]
+
+          # Identify numerical features
+          numerical_features = X_train.select_dtypes(
+              include="number"
+          ).columns.tolist()
+
+          # Preprocessing pipeline
+          preprocessor = ColumnTransformer(
+              transformers=[
+                  (
+                      "numerical",
+                      Pipeline(steps=[
+                          ("imputer", SimpleImputer(strategy="median")),
+                          ("scaler", StandardScaler())
+                      ]),
+                      numerical_features
+                  )
+              ],
+              remainder="drop"
+          )
+
+          # XGBoost classifier using selected parameters
+          xgb_classifier = XGBClassifier(
+              n_estimators=200,
+              learning_rate=0.1,
+              max_depth=3,
+              subsample=1.0,
+              objective="binary:logistic",
+              eval_metric="logloss",
+              random_state=42,
+              n_jobs=1
+          )
+
+          # Complete model pipeline
+          model = Pipeline(steps=[
+              ("preprocessor", preprocessor),
+              ("model", xgb_classifier)
+          ])
+
+          # Train model
+          model.fit(X_train, y_train)
+
+          # Predictions
+          y_pred = model.predict(X_test)
+          y_prob = model.predict_proba(X_test)[:, 1]
+
+          # Evaluation metrics
+          metrics = {
+              "test_accuracy": float(accuracy_score(y_test, y_pred)),
+              "test_precision": float(
+                  precision_score(y_test, y_pred, zero_division=0)
+              ),
+              "test_recall": float(
+                  recall_score(y_test, y_pred, zero_division=0)
+              ),
+              "test_f1_score": float(
+                  f1_score(y_test, y_pred, zero_division=0)
+              ),
+              "test_roc_auc": float(
+                  roc_auc_score(y_test, y_prob)
+              )
+          }
+
+          # Save trained model
+          os.makedirs("models", exist_ok=True)
+
+          joblib.dump(
+              model,
+              "models/xgboost_model.pkl"
+          )
+
+          # Save evaluation report
+          os.makedirs("reports", exist_ok=True)
+
+          with open("reports/ci_metrics.json", "w") as f:
+              json.dump(metrics, f, indent=4)
+
+          with open("reports/ci_classification_report.txt", "w") as f:
+              f.write(
+                  classification_report(
+                      y_test, y_pred, zero_division=0
+                  )
+              )
+
+          print("XGBoost training completed.")
+          print("\nEvaluation metrics:")
+
+          for name, value in metrics.items():
+              print(f"{name}: {value:.4f}")
+
+          print("\nModel saved successfully.")
+          PY
+
+      - name: Commit Updated Model and Reports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add models/xgboost_model.pkl
+          git add reports/ci_metrics.json
+          git add reports/ci_classification_report.txt
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update XGBoost model through GitHub Actions"
+            git push
+          else
+            echo "No model or report changes to commit."
+          fi
